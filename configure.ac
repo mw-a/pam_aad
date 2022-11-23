@@ -1,5 +1,5 @@
 dnl Process this file with autoconf to produce a configure script.
-AC_PREREQ([2.65])
+AC_PREREQ([2.71])
 AC_INIT([pam_aad], [0.0.5], [open.source@infinite-omicron.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
@@ -11,7 +11,6 @@ AC_USE_SYSTEM_EXTENSIONS
 dnl Checks for programs.
 AC_PROG_CC_C_O 
 AM_PROG_AR
-AC_LIBTOOL_WIN32_DLL
 AC_DISABLE_STATIC
 
 LT_INIT([disable-static])
@@ -26,8 +25,7 @@ AC_ARG_ENABLE([man],
 
 AC_SUBST(PAMDIR, "\$(exec_prefix)/lib/security")
 AC_ARG_WITH(pam-dir,
-	    AC_HELP_STRING([--with-pam-dir=DIR],
-			   [Where to install PAM module [[PREFIX/lib/security]]]),
+	    AS_HELP_STRING([--with-pam-dir=DIR],[Where to install PAM module [[PREFIX/lib/security]]]),
 			   [case "${withval}" in
 			    /*) PAMDIR="${withval}";;
 			    ./*|../*) AC_MSG_ERROR(Bad value for --with-pam-dir);;
