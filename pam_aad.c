@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
@@ -22,7 +23,7 @@
 #define SUBJECT "Your one-time passcode for signing in via Azure Active Directory"
 #define TTW 5                   /* time to wait in seconds */
 #define USER_AGENT "azure_authenticator_pam/1.0"
-#define USER_PROMPT "\n\nEnter the code at https://aka.ms/devicelogin"
+#define USER_PROMPT "\n\nEnter the code at "
 
 #ifndef _AAD_EXPORT
 #define STATIC static
@@ -41,7 +42,7 @@ struct response {
 };
 
 struct ret_data {
-    const char *u_code, *d_code, *auth_bearer;
+    char *u_code, *d_code, *verify_uri, *token;
 };
 
 STATIC size_t read_callback(void *ptr, size_t size, size_t nmemb,
@@ -138,8 +139,32 @@ STATIC char *get_message_id(void)
     return message_id;
 }
 
-STATIC json_t *curl(const char *endpoint, const char *post_body,
-                    struct curl_slist *headers, bool debug)
+STATIC int curl_log(CURL *handle, curl_infotype type, char *data, size_t size,
+        void *userptr) {
+    pam_handle_t *pamh = (pam_handle_t *)userptr;
+    char *text;
+    (void)handle;
+
+    if (type != CURLINFO_TEXT)
+        return 0;
+
+    text = malloc(6 /* curl:  */ + size + 1 /* nul */);
+    if (text == NULL) {
+        pam_syslog(pamh, LOG_CRIT, "error allocating memory in curl debug function");
+        return CURLE_OK;
+    }
+
+    strcpy(text, "curl: ");
+    memcpy(text + 6, data, size);
+    text[6 + size] = '\0';
+
+    pam_syslog(pamh, LOG_DEBUG, text);
+    free(text);
+    return CURLE_OK;
+}
+
+STATIC json_t *curl(pam_handle_t *pamh, const char *endpoint, const char *post_body,
+                    struct curl_slist * headers, bool debug)
 {
     CURL *curl;
     CURLcode res;
@@ -152,6 +177,11 @@ STATIC json_t *curl(const char *endpoint, const char *post_body,
     resp.size = 0;
 
     curl = curl_easy_init();
+    if (curl == NULL) {
+        pam_syslog(pamh, LOG_CRIT, "error initialising curl for oauth2 request");
+        return NULL;
+    }
+
     curl_easy_setopt(curl, CURLOPT_URL, endpoint);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_body);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, response_callback);
@@ -162,21 +192,22 @@ STATIC json_t *curl(const char *endpoint, const char *post_body,
     if (headers)
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    if (debug)
+    if (debug) {
         curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curl_log);
+        curl_easy_setopt(curl, CURLOPT_DEBUGDATA, pamh);
+    }
 
     res = curl_easy_perform(curl);
 
     if (res != CURLE_OK) {
-        fprintf(stderr, "curl_easy_perform() failed: %s\n",
+        pam_syslog(pamh, LOG_CRIT, "curl_easy_perform() failed: %s\n",
                 curl_easy_strerror(res));
     } else {
         data = json_loads(resp.data, 0, &error);
 
         if (!data) {
-            fprintf(stderr, "json_loads() failed: %s\n", error.text);
-
-            return NULL;
+            pam_syslog(pamh, LOG_CRIT, "json_loads() failed: %s\n", error.text);
         }
     }
 
@@ -186,93 +217,151 @@ STATIC json_t *curl(const char *endpoint, const char *post_body,
     return data;
 }
 
-STATIC void auth_bearer_request(struct ret_data *data,
-                                const char *client_id, const char *tenant,
-                                const char *code, json_t * json_data,
-                                bool debug)
+STATIC int auth_bearer_request(pam_handle_t *pamh, struct ret_data *data, const
+        char *client_id, const char *tenant, const char *device_code,
+        bool debug)
 {
-    const char *auth_bearer;
+    json_t *json_data;
+    int ret = EXIT_FAILURE;
 
     sds endpoint = sdsnew(HOST);
-    endpoint = sdscat(endpoint, "common/oauth2/token");
+    endpoint = sdscat(endpoint, tenant);
+    endpoint = sdscat(endpoint, "/oauth2/v2.0/token");
 
-    sds post_body = sdsnew("resource=" RESOURCE);
-    post_body = sdscat(post_body, "&code=");
-    post_body = sdscat(post_body, code);
+    sds post_body = sdsnew("device_code=");
+    post_body = sdscat(post_body, device_code);
     post_body = sdscat(post_body, "&client_id=");
     post_body = sdscat(post_body, client_id);
-    post_body = sdscat(post_body, "&grant_type=device_code");
+    post_body = sdscat(post_body, "&grant_type=urn:ietf:params:oauth:grant-type:device_code");
 
     for (;;) {
         nanosleep((const struct timespec[]) { {
                                                TTW, 0 }
                   }, NULL);
-        json_data = curl(endpoint, post_body, NULL, debug);
-
-        if (json_object_get(json_data, "access_token")) {
-            auth_bearer =
-                json_string_value(json_object_get
-                                  (json_data, "access_token"));
-        } else {
-            auth_bearer =
-                json_string_value(json_object_get(json_data, "error"));
+        json_data = curl(pamh, endpoint, post_body, NULL, debug);
+        if (json_data == NULL) {
+            pam_syslog(pamh, LOG_CRIT, "no data returned from token endpoint");
+            goto out;
         }
 
-        if (strcmp(auth_bearer, AUTH_ERROR) != 0)
-            break;
+        if (json_object_get(json_data, "access_token")) {
+            data->token =
+                strdup(json_string_value(json_object_get
+                                  (json_data, "access_token")));
+            json_decref(json_data);
 
+            if (data->token == NULL) {
+                pam_syslog(pamh, LOG_CRIT, "error allocating memory when retrieving access token");
+                break;
+            }
+
+            ret = EXIT_SUCCESS;
+            break;
+        } else if (json_object_get(json_data, "error")) {
+            const char *error =
+                json_string_value(json_object_get(json_data, "error"));
+            if (strcmp(error, AUTH_ERROR) != 0) {
+            const char *desc =
+                json_string_value(json_object_get(json_data, "error_description"));
+                pam_syslog(pamh, LOG_CRIT, "error retrieving access token: %s %s", error, desc);
+                json_decref(json_data);
+                break;
+            }
+        } else {
+            pam_syslog(pamh, LOG_CRIT, "invalid json when retrieving access token");
+            json_decref(json_data);
+            break;
+        }
+
+        json_decref(json_data);
     }
 
+out:
     sdsfree(endpoint);
     sdsfree(post_body);
-
-    data->auth_bearer = auth_bearer;
+    return ret;
 }
 
-STATIC void oauth_request(struct ret_data *data, const char *client_id,
-                          const char *tenant, json_t * json_data,
-                          bool debug)
+STATIC int oauth_request(pam_handle_t *pamh, struct ret_data *data, const char *client_id,
+        const char *tenant, bool debug)
 {
-    const char *d_code, *u_code;
+    json_t *json_data;
+    int ret = EXIT_FAILURE;
 
     sds endpoint = sdsnew(HOST);
     endpoint = sdscat(endpoint, tenant);
-    endpoint = sdscat(endpoint, "/oauth2/devicecode/");
+    endpoint = sdscat(endpoint, "/oauth2/v2.0/devicecode");
 
-    sds post_body = sdsnew("resource=" RESOURCE);
-    post_body = sdscat(post_body, "&client_id=");
+    sds post_body = sdsnew("client_id=");
     post_body = sdscat(post_body, client_id);
-    post_body = sdscat(post_body, "&scope=profile");
+    post_body = sdscat(post_body, "&scope=profile%20openid");
 
-    json_data = curl(endpoint, post_body, NULL, debug);
-
-    if (json_object_get(json_data, "device_code")
-        && json_object_get(json_data, "user_code")) {
-        d_code =
-            json_string_value(json_object_get(json_data, "device_code"));
-        u_code =
-            json_string_value(json_object_get(json_data, "user_code"));
-    } else {
-        fprintf(stderr,
-                "json_object_get() failed: device_code & user_code NULL\n");
-
-        exit(1);
+    json_data = curl(pamh, endpoint, post_body, NULL, debug);
+    if (json_data == NULL) {
+        pam_syslog(pamh, LOG_CRIT, "no data returned from devicecode endpoint");
+        goto out;
     }
 
-    data->d_code = d_code;
-    data->u_code = u_code;
+    if (json_object_get(json_data, "device_code")
+        && json_object_get(json_data, "user_code")
+        && json_object_get(json_data, "verification_uri")) {
+        data->d_code =
+            strdup(json_string_value(json_object_get(json_data, "device_code")));
+        data->u_code =
+            strdup(json_string_value(json_object_get(json_data, "user_code")));
+        data->verify_uri =
+            strdup(json_string_value(json_object_get(json_data, "verification_uri")));
 
+        if (data->d_code && data->u_code && data->verify_uri) {
+            ret = EXIT_SUCCESS;
+        } else {
+            pam_syslog(pamh, LOG_CRIT,
+                    "error allocating memory retrieving device, user code or verification URL");
+        }
+    } else {
+        pam_syslog(pamh, LOG_CRIT,
+                "device_code, user_code or verification URL is missing from json response");
+    }
+
+    json_decref(json_data);
+out:
     sdsfree(endpoint);
     sdsfree(post_body);
+    return ret;
 }
 
-STATIC int verify_user(jwt_t * jwt, const char *username)
+STATIC int verify_user(pam_handle_t *pamh, const char *token, const char *username, bool debug)
 {
-    const char *upn = jwt_get_grant(jwt, "upn");
-    return (strcmp(upn, username) == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    int ret = EXIT_FAILURE;
+    jwt_t *jwt;
+    if (jwt_decode(&jwt, token, NULL, 0) < 0) {
+        pam_syslog(pamh, LOG_CRIT, "decoding token failed");
+        return EXIT_FAILURE;
+    }
+
+    const char *upn = jwt_get_grant(jwt, "unique_name");
+    if (upn == NULL) {
+        pam_syslog(pamh, LOG_CRIT, "decoding token failed");
+        goto out;
+    }
+
+
+    if (strcmp(upn, username) == 0) {
+        if (debug) {
+            pam_syslog(pamh, LOG_DEBUG, "user %s successfully verified", username);
+        }
+
+        ret = EXIT_SUCCESS;
+    } else {
+        pam_syslog(pamh, LOG_WARNING, "logon user %s does not match credential user %s", username, upn);
+    }
+
+out:
+    jwt_free(jwt);
+    return ret;
 }
 
-STATIC int verify_group(const char *auth_token, const char *group_id,
+STATIC int verify_group(pam_handle_t *pamh, const char *auth_token, const char *username, const char *group_id,
                         bool debug)
 {
     json_t *resp;
@@ -291,7 +380,12 @@ STATIC int verify_group(const char *auth_token, const char *group_id,
     post_body = sdscat(post_body, group_id);
     post_body = sdscat(post_body, "\"]}");
 
-    resp = curl(endpoint, post_body, headers, debug);
+    resp = curl(pamh, endpoint, post_body, headers, debug);
+    if (resp == NULL) {
+        pam_syslog(pamh, LOG_CRIT, "no data returned from group member check endpoint");
+        goto out;
+    }
+
     resp = json_object_get(resp, "value");
 
     if (resp) {
@@ -299,25 +393,37 @@ STATIC int verify_group(const char *auth_token, const char *group_id,
         json_t *value;
 
         json_array_foreach(resp, index, value) {
-            if (strcmp(json_string_value(value), group_id) == 0)
+            if (strcmp(json_string_value(value), group_id) == 0) {
+                if (debug) {
+                    pam_syslog(pamh, LOG_DEBUG, "successfully verfied that user %s is member of group %s", username, group_id);
+                }
+
                 ret = EXIT_SUCCESS;
+                break;
+            }
+        }
+
+        if (ret != EXIT_SUCCESS) {
+            pam_syslog(pamh, LOG_WARNING, "user %s is not member of group %s", username, group_id);
         }
     } else {
-        fprintf(stderr, "json_object_get() failed: value NULL\n");
+        pam_syslog(pamh, LOG_CRIT, "json_object_get() failed: value NULL\n");
     }
 
-    curl_slist_free_all(headers);
     json_decref(resp);
+
+out:
+    curl_slist_free_all(headers);
+    sdsfree(endpoint);
     sdsfree(auth_header);
     return ret;
 }
 
-STATIC int notify_user(const char *to_addr, const char *from_addr,
-                       const char *message, const char *smtp_server,
-                       bool debug)
+STATIC int notify_user(pam_handle_t *pamh, const char *to_addr, const char *from_addr, const char *message, const char *smtp_server, bool debug)
 {
+    int ret = EXIT_FAILURE;
     CURL *curl;
-    CURLcode res = CURLE_OK;
+    CURLcode res;
     int msg_len = 9;
     struct curl_slist *recipients = NULL;
     struct message *msg;
@@ -352,50 +458,61 @@ STATIC int notify_user(const char *to_addr, const char *from_addr,
     msg->data[8] = NULL;
 
     curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_USE_SSL, (long) CURLUSESSL_ALL);
-        curl_easy_setopt(curl, CURLOPT_URL, smtp_url);
-        curl_easy_setopt(curl, CURLOPT_MAIL_FROM, from_addr);
-        recipients = curl_slist_append(recipients, to_addr);
-        curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recipients);
-        curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
-        curl_easy_setopt(curl, CURLOPT_READDATA, msg);
-        curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-
-        if (debug)
-            curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-        res = curl_easy_perform(curl);
-
-        if (res != CURLE_OK)
-            fprintf(stderr, "curl_easy_perform() failed: %s\n",
-                    curl_easy_strerror(res));
-
-        curl_slist_free_all(recipients);
-        curl_easy_cleanup(curl);
+    if (curl == NULL) {
+        pam_syslog(pamh, LOG_CRIT, "error initialising curl for user notification");
+        goto out;
     }
 
+    curl_easy_setopt(curl, CURLOPT_USE_SSL, (long) CURLUSESSL_ALL);
+    curl_easy_setopt(curl, CURLOPT_URL, smtp_url);
+    curl_easy_setopt(curl, CURLOPT_MAIL_FROM, from_addr);
+    recipients = curl_slist_append(recipients, to_addr);
+    curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recipients);
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
+    curl_easy_setopt(curl, CURLOPT_READDATA, msg);
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+
+    if (debug) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, curl_log);
+        curl_easy_setopt(curl, CURLOPT_DEBUGDATA, pamh);
+    }
+
+    res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        pam_syslog(pamh, LOG_CRIT, "curl_easy_perform() failed: %s\n",
+                curl_easy_strerror(res));
+        goto out2;
+    }
+
+    ret = EXIT_SUCCESS;
+
+out2:
+    curl_slist_free_all(recipients);
+    curl_easy_cleanup(curl);
+
+out:
     free(msg->data[0]);
     free(msg->data[3]);
-    return (int) res;
+    free(msg);
+    return ret;
 }
 
 STATIC int azure_authenticator(pam_handle_t * pamh, const char *user)
 {
-    jwt_t *jwt;
     bool debug = DEBUG;
     bool send_email = false;
     const char *client_id, *group_id, *tenant,
-        *domain, *u_code, *d_code, *ab_token, *tenant_addr, *smtp_server;
+        *domain, *ab_token, *tenant_addr, *smtp_server;
 
     struct ret_data data;
-    json_t *json_data = NULL, *config = NULL;
+    json_t *config = NULL;
     json_error_t error;
     int ret = EXIT_FAILURE;
 
     config = json_load_file(CONFIG_FILE, 0, &error);
     if (!config) {
-        fprintf(stderr, "error in config on line %d: %s\n", error.line,
+        pam_syslog(pamh, LOG_CRIT, "error in config on line %d: %s\n", error.line,
                 error.text);
         return ret;
     }
@@ -411,14 +528,14 @@ STATIC int azure_authenticator(pam_handle_t * pamh, const char *user)
             json_string_value(json_object_get
                               (json_object_get(config, "client"), "id"));
     } else {
-        fprintf(stderr, "error with Client ID in JSON\n");
+        pam_syslog(pamh, LOG_CRIT, "error with Client ID in JSON\n");
         return ret;
     }
 
     if (json_object_get(config, "domain")) {
         domain = json_string_value(json_object_get(config, "domain"));
     } else {
-        fprintf(stderr, "error with Domain in JSON\n");
+        pam_syslog(pamh, LOG_CRIT, "error with Domain in JSON\n");
         return ret;
     }
 
@@ -427,25 +544,7 @@ STATIC int azure_authenticator(pam_handle_t * pamh, const char *user)
             json_string_value(json_object_get
                               (json_object_get(config, "group"), "id"));
     } else {
-        fprintf(stderr, "error with Group ID in JSON\n");
-        return ret;
-    }
-
-    if (json_object_get(config, "tenant")) {
-        tenant =
-            json_string_value(json_object_get
-                              (json_object_get(config, "tenant"), "name"));
-        if (json_object_get(json_object_get(config, "tenant"), "address")) {
-            tenant_addr =
-                json_string_value(json_object_get
-                                  (json_object_get(config, "tenant"),
-                                   "address"));
-        } else {
-            fprintf(stderr, "error with tenant address in JSON\n");
-            return ret;
-        }
-    } else {
-        fprintf(stderr, "error with tenant in JSON\n");
+        pam_syslog(pamh, LOG_CRIT, "error with Group ID in JSON\n");
         return ret;
     }
 
@@ -455,42 +554,73 @@ STATIC int azure_authenticator(pam_handle_t * pamh, const char *user)
             json_string_value(json_object_get(config, "smtp_server"));
     }
 
+    if (json_object_get(config, "tenant")) {
+        tenant =
+            json_string_value(json_object_get
+                              (json_object_get(config, "tenant"), "name"));
+
+        if (send_email) {
+            if (json_object_get(json_object_get(config, "tenant"), "address")) {
+                tenant_addr =
+                    json_string_value(json_object_get
+                                      (json_object_get(config, "tenant"),
+                                       "address"));
+            } else {
+                pam_syslog(pamh, LOG_CRIT, "error with tenant address in JSON\n");
+                return ret;
+            }
+        }
+    } else {
+        pam_syslog(pamh, LOG_CRIT, "error with tenant in JSON\n");
+        return ret;
+    }
+
     sds user_addr = sdsnew(user);
     user_addr = sdscat(user_addr, "@");
     user_addr = sdscat(user_addr, domain);
 
     curl_global_init(CURL_GLOBAL_ALL);
 
-    oauth_request(&data, client_id, tenant, json_data, debug);
-
-    u_code = data.u_code;
-    d_code = data.d_code;
+    if (oauth_request(pamh, &data, client_id, tenant, debug) != EXIT_SUCCESS) {
+        pam_syslog(pamh, LOG_CRIT, "request to devicecode endpoint failed");
+        goto out_config;
+    }
 
     sds prompt = sdsnew(CODE_PROMPT);
-    prompt = sdscat(prompt, u_code);
+    prompt = sdscat(prompt, data.u_code);
     prompt = sdscat(prompt, USER_PROMPT);
+    prompt = sdscat(prompt, data.verify_uri);
 
     if (send_email) {
-        prompt = sdscat(prompt, ", then press enter.");
-        notify_user(user_addr, tenant_addr, prompt, smtp_server, debug);
-    } else {
         prompt = sdscat(prompt, ".");
+        if (notify_user(pamh, user_addr, tenant_addr, prompt, smtp_server, debug) != EXIT_SUCCESS) {
+            pam_syslog(pamh, LOG_CRIT, "notifying user failed");
+            goto out_config;
+        }
+    } else {
+        prompt = sdscat(prompt, ", then press enter.");
         (void) pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, NULL, "%s", prompt);
     }
 
-    auth_bearer_request(&data, client_id, tenant,
-                        d_code, json_data, debug);
+    if (auth_bearer_request(pamh, &data, client_id, tenant, data.d_code,
+                        debug) != EXIT_SUCCESS) {
+        pam_syslog(pamh, LOG_CRIT, "request to token endpoint failed");
+        goto out_config;
+    }
+
     curl_global_cleanup();
-    ab_token = data.auth_bearer;
-    jwt_decode(&jwt, ab_token, NULL, 0);
-    if (verify_user(jwt, user_addr) == 0
-        && verify_group(ab_token, group_id, debug) == 0) {
+    if (verify_user(pamh, data.token, user_addr, debug) == EXIT_SUCCESS
+        && verify_group(pamh, data.token, user_addr, group_id, debug) == EXIT_SUCCESS) {
         ret = EXIT_SUCCESS;
     }
 
-    json_decref(json_data);
+out_config:
     json_decref(config);
-    jwt_free(jwt);
+    free(data.token);
+    free(data.d_code);
+    free(data.u_code);
+    free(data.verify_uri);
+
     return ret;
 }
 
@@ -502,11 +632,11 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *
     const char *user;
     int ret = PAM_AUTH_ERR;
     if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS) {
-        fprintf(stderr, "pam_get_user(): failed to get a username\n");
+        pam_syslog(pamh, LOG_CRIT, "pam_get_user(): failed to get a username\n");
         return ret;
     }
 
-    if (azure_authenticator(pamh, user) == 0)
+    if (azure_authenticator(pamh, user) == EXIT_SUCCESS)
         return PAM_SUCCESS;
     return ret;
 }
