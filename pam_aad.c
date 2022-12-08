@@ -364,7 +364,7 @@ out:
 STATIC int verify_group(pam_handle_t *pamh, const char *auth_token, const char *username, const char *group_id,
                         bool debug)
 {
-    json_t *resp;
+    json_t *resp, *value;
     struct curl_slist *headers = NULL;
     int ret = EXIT_FAILURE;
 
@@ -386,14 +386,14 @@ STATIC int verify_group(pam_handle_t *pamh, const char *auth_token, const char *
         goto out;
     }
 
-    resp = json_object_get(resp, "value");
+    value = json_object_get(resp, "value");
 
-    if (resp) {
+    if (value) {
         size_t index;
-        json_t *value;
+        json_t *group_json;
 
-        json_array_foreach(resp, index, value) {
-            if (strcmp(json_string_value(value), group_id) == 0) {
+        json_array_foreach(value, index, group_json) {
+            if (strcmp(json_string_value(group_json), group_id) == 0) {
                 if (debug) {
                     pam_syslog(pamh, LOG_DEBUG, "successfully verfied that user %s is member of group %s", username, group_id);
                 }
@@ -407,7 +407,15 @@ STATIC int verify_group(pam_handle_t *pamh, const char *auth_token, const char *
             pam_syslog(pamh, LOG_WARNING, "user %s is not member of group %s", username, group_id);
         }
     } else {
-        pam_syslog(pamh, LOG_CRIT, "json_object_get() failed: value NULL\n");
+        json_t *error_json = json_object_get(resp, "error");
+        const char *message = "unknown error";
+
+        if (error_json)
+            error_json = json_object_get(error_json, "message");
+        if (error_json)
+            message = json_string_value(error_json);
+
+        pam_syslog(pamh, LOG_CRIT, "error verifying group membership: %s\n", message);
     }
 
     json_decref(resp);
