@@ -584,8 +584,11 @@ STATIC int azure_authenticator(pam_handle_t * pamh, const char *user)
     }
 
     sds user_addr = sdsnew(user);
-    user_addr = sdscat(user_addr, "@");
-    user_addr = sdscat(user_addr, domain);
+    if (!strchr(user_addr, '@')) {
+        /* append default domain if none given */
+        user_addr = sdscat(user_addr, "@");
+        user_addr = sdscat(user_addr, domain);
+    }
 
     curl_global_init(CURL_GLOBAL_ALL);
 
