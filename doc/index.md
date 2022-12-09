@@ -64,23 +64,15 @@ Create the file ```/etc/pam_aad.conf``` and fill it with:
 
   - For Supported account types select `Accounts in this organizational directory only (Organization Name)`.
 
+  - Leave empty `Redirect URIs (Optional)` as the module is not using any OAuth2 flows requiring them.
+
 - Next click "Register", down at the bottom.
 
 - From the "Overview" page, under "Manage", select "Authentication".
 
-  - For "Redirect URIs":
-
-    - Select `Public client (mobile & desktop)` from the "Type" drop-down field.
-
-    - Enter `https://linux-auth.org` in the "Redirect URI" field.
-
   - For "Advanced settings":
 
-    - Select `ID tokens`, under "Implicit grant".
-
-  - For "Supported account types":
-
-    - Select `Accounts in this organizational directory only (Organization Name)`.
+    - Select `Allow public client flows`, as the module is using the `Device Code Flow`.
 
 - Next, click "Save", back up near the top.
 
@@ -88,13 +80,13 @@ Create the file ```/etc/pam_aad.conf``` and fill it with:
 
   - Delete any existing permissions (The delegated permission, `Microsoft Graph (1)`, `User.Read` seems to be added by default).
 
-  **NOTE: This module makes use of the `Windows Azure Active Directory` API, not the `Microsoft Graph` API** ([#8](https://github.com/CyberNinjas/pam_aad/issues/8)).
-
-  - Select "Add a permission", then under "Supported legacy APIs", choose `Azure Active Directory Graph`.
+  - Select "Add a permission", then under "Select an API", "Microsoft APIs", "Commonly used Microsoft APIs", choose `Microsoft Graph`.
 
     - Choose "Delegated permissions".
 
-    - Under "Select permissions", choose `User.Read`.
+    - Under "Select permissions", choose `User.Read.All` and `GroupMember.Read.All`.
+
+    - This allows the module to check the group memberships of the logged in user using their credentials (thus "Delegated").
 
 2) PAM:
 
